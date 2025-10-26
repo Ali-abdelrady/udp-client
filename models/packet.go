@@ -1,6 +1,9 @@
 package models
 
-import "net"
+import (
+	"net"
+	"time"
+)
 
 type Packet struct {
 	Payload  []byte
@@ -15,4 +18,11 @@ type Packet struct {
 type RawPacket struct {
 	Data []byte
 	Addr *net.UDPAddr
+}
+
+type PendingPacket struct {
+	Packet   Packet
+	SendTime time.Time
+	Retries  int
+	AckChan  chan bool
 }

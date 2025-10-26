@@ -6,7 +6,6 @@ import (
 	"fmt"
 	"hole-punching-client/models"
 	"hole-punching-client/utils"
-	"hole-punching-client/workers"
 	"io"
 	"net"
 	"os"
@@ -20,7 +19,9 @@ import (
 
 const (
 	BUFFER_SIZE = 65507
-	CHUNKSIZE   = 50000
+	CHUNKSIZE   = 1400
+	alpha       = 0.125
+	beta        = 0.25
 )
 
 const (
@@ -41,15 +42,20 @@ type Client struct {
 	parserChan     chan models.RawPacket
 	writeChan      chan models.Packet
 	generateChan   chan models.Packet
-	trackingChan   chan models.Packet
+	ackChan        chan models.Packet
 	fileMetaChan   chan models.FileMeta
 	fileChunksChan chan models.FileChunk
 
-	receivedFiles sync.Map // map[uint32]*models.ReceiveSession
-	sendOutFiles  sync.Map // map[uint32]*models.SendSession
+	receivedFiles  sync.Map // map[uint32]*models.ReceiveSession
+	sendOutFiles   sync.Map // map[uint32]*models.SendSession
+	pendingPackets sync.Map
+
+	smoothedRTT time.Duration
+	rttVar      time.Duration
+	rto         time.Duration // Retransmission time out
 
 	// fileManger *workers.FileManager
-	ackManger *workers.AckManager
+	// ackManger *workers.AckManager
 }
 
 func (c *Client) ConnectToServer(addr string) {
@@ -72,21 +78,19 @@ func (c *Client) ConnectToServer(addr string) {
 	c.writeChan = make(chan models.Packet, 50)
 	c.parserChan = make(chan models.RawPacket, 50)
 	c.generateChan = make(chan models.Packet, 50)
-	c.trackingChan = make(chan models.Packet, 200)
+	c.ackChan = make(chan models.Packet, 200)
 	c.fileChunksChan = make(chan models.FileChunk, 100)
 	c.fileMetaChan = make(chan models.FileMeta, 50)
 
-	c.ackManger = workers.NewAckManager()
-
-	for i := 0; i < 3; i++ {
-		go c.parserWorker()
-		go c.writeWorker(connection)
-		go c.generatorWorker()
-		go c.trackingWorker()
-		go c.fileChunkWorker()
-	}
+	// c.ackManger = workers.NewAckManager()
 
 	// go c.RegisterClient()
+	go c.parserWorker()
+	go c.writeWorker(connection)
+	go c.generatorWorker()
+	go c.ackListener()
+	go c.retransmissionWorker()
+	go c.fileChunkWorker()
 	go c.pingServer()
 	go c.startInteractiveCommandInput()
 	go c.fileMetaWorker()
@@ -218,17 +222,10 @@ func (c *Client) parserWorker() {
 		switch packet.OpCode {
 		case OpAck:
 			// fmt.Println("[Server] -> ", string(packet.Payload))
-			ch := c.ackManger.GetAck(packet.ID)
-			if ch != nil {
-				ch <- true
-			}
+			c.ackChan <- packet
 		case OpPong:
 			fmt.Printf("Client%d Ping Ack Recived \n", c.ID)
-
-			ch := c.ackManger.GetAck(packet.ID)
-			if ch != nil {
-				ch <- true
-			}
+			c.ackChan <- packet
 		case OpMessage:
 			fmt.Println("[Server] -> ", string(packet.Payload))
 			fmt.Printf("Recived Packet ID : %v\n", packet.ID)
@@ -272,8 +269,15 @@ func (c *Client) generatorWorker() {
 		// fmt.Printf("Going PacketID = %v , Size = %v \n", outgoingPacket.ID, len(buf))
 
 		switch packet.OpCode {
-		case OpMessage, OpFileMeta:
-			c.sendWithAck(outgoingPacket)
+		case OpMessage, OpFileMeta, OpPing:
+			pp := &models.PendingPacket{
+				Packet:   outgoingPacket,
+				SendTime: time.Now(),
+				Retries:  0,
+				AckChan:  make(chan bool, 1),
+			}
+			c.pendingPackets.Store(outgoingPacket.ID, pp)
+			c.writeChan <- outgoingPacket
 		default:
 			c.writeChan <- outgoingPacket
 		}
@@ -281,12 +285,61 @@ func (c *Client) generatorWorker() {
 	}
 }
 
-func (c *Client) trackingWorker() {
-	for packet := range c.trackingChan {
-		err := c.sendWithAck(packet)
-		if err != nil {
-			fmt.Printf("[Tracking] Failed to deliver packet %d after retries\n", packet.ID)
+func (c *Client) ackListener() {
+
+	for {
+		ackPkt := <-c.ackChan
+
+		if value, ok := c.pendingPackets.Load(ackPkt.ID); ok {
+
+			pp := value.(*models.PendingPacket)
+			rtt := time.Since(pp.SendTime)
+
+			c.updateRTT(rtt)
+			fmt.Printf(
+				"Packet %v | RTT: %v | Smoothed: %v | Var: %v | RTO: %v\n",
+				pp.Packet.ID, rtt, c.smoothedRTT, c.rttVar, c.rto,
+			)
+			pp.AckChan <- true
+			c.pendingPackets.Delete(ackPkt.ID)
 		}
+	}
+}
+
+func (c *Client) retransmissionWorker() {
+	maxRetries := 3
+	ticker := time.NewTicker(200 * time.Millisecond) // check more frequently
+
+	for range ticker.C {
+		now := time.Now()
+
+		c.pendingPackets.Range(func(key, value any) bool {
+			pp := value.(*models.PendingPacket)
+
+			// Get latest adaptive RTO
+			baseTimeout := c.rto
+			if baseTimeout == 0 {
+				baseTimeout = 500 * time.Millisecond // default before any RTT samples
+			}
+
+			nextRetryDelay := baseTimeout * time.Duration(1<<pp.Retries)
+
+			// Check if timeout expired
+			if now.Sub(pp.SendTime) > nextRetryDelay && pp.Retries < maxRetries {
+				fmt.Printf("⏱️ Retrying packet %d (attempt %d, timeout=%v)\n",
+					pp.Packet.ID, pp.Retries+1, baseTimeout)
+
+				// Retransmit
+				c.writeChan <- pp.Packet
+				pp.SendTime = now
+				pp.Retries++
+			} else if pp.Retries >= maxRetries {
+				fmt.Printf("❌ Packet %d failed after %d retries\n", pp.Packet.ID, pp.Retries)
+				c.pendingPackets.Delete(pp.Packet.ID)
+			}
+
+			return true
+		})
 	}
 }
 
@@ -380,45 +433,6 @@ func (c *Client) RequestFileChunks(session *models.ReceiveSession) {
 			return
 		}
 	}
-}
-
-func (c *Client) sendWithAck(packet models.Packet) error {
-	retries := 3
-
-	// Register a pending acknowledgment channel
-	c.ackManger.AddAck(packet.ID)
-
-	ackCh := c.ackManger.GetAck(packet.ID)
-	if ackCh == nil {
-		return fmt.Errorf("failed to create ack channel for packet %d", packet.ID)
-	}
-
-	// fmt.Println("pendingAck:", c.pendingAck)
-	defer c.ackManger.DeleteAck(packet.ID)
-
-	for i := 0; i < retries; i++ {
-
-		c.writeChan <- packet
-		// time.Sleep(1 * time.Millisecond) // 👈 helps throttle sending rate
-
-		select {
-		case <-ackCh:
-			if packet.Done != nil {
-				packet.Done <- true
-			}
-			fmt.Printf("ACK received for packet %d\n", packet.ID)
-			return nil
-		case <-time.After(5 * time.Second):
-			fmt.Printf("Timeout for packet %d, retrying...\n", packet.ID)
-		}
-	}
-
-	if packet.Done != nil {
-		packet.Done <- false
-	}
-
-	return fmt.Errorf("failed to deliver packet %d", packet.ID)
-
 }
 
 func (c *Client) sendChunkStatusRequest(reqPacket models.Packet) {
@@ -576,11 +590,12 @@ func (c *Client) onFileChunkReceived(packet models.Packet) {
 
 	c.fileChunksChan <- chunk
 
+	c.ackChan <- packet
 	// Mark as chunk recieved
-	ch := c.ackManger.GetAck(packet.ID)
-	if ch != nil {
-		ch <- true
-	}
+	// ch := c.ackManger.GetAck(packet.ID)
+	// if ch != nil {
+	// 	ch <- true
+	// }
 
 }
 
@@ -589,11 +604,12 @@ func (c *Client) onChunkStatusResponseReceived(packet models.Packet) {
 	seq := binary.BigEndian.Uint16(packet.Payload[4:6])
 	status := packet.Payload[6]
 
+	c.ackChan <- packet
 	// Send ACk
-	ch := c.ackManger.GetAck(packet.ID)
-	if ch != nil {
-		ch <- true
-	}
+	// ch := c.ackManger.GetAck(packet.ID)
+	// if ch != nil {
+	// 	ch <- true
+	// }
 
 	val, ok := c.receivedFiles.Load(fileID)
 	if !ok {
@@ -755,4 +771,23 @@ func (clientID *Client) setupGracfulShutdown() {
 		utils.PrintApiLog("Server Exit")
 		os.Exit(0)
 	}()
+}
+
+func (c *Client) updateRTT(rtt time.Duration) {
+	// Update the RTT
+	if c.smoothedRTT == 0 {
+		c.smoothedRTT = rtt
+		c.rttVar = rtt / 2
+	} else {
+		rttDiff := c.smoothedRTT - rtt
+		if rttDiff < 0 {
+			rttDiff = -rttDiff
+		}
+
+		c.rttVar = time.Duration((1-beta)*float64(c.rttVar) + beta*float64(rttDiff))
+		c.smoothedRTT = time.Duration((1-alpha)*float64(c.smoothedRTT) + alpha*float64(rtt))
+	}
+
+	c.rto = c.smoothedRTT + 4*c.rttVar
+
 }
