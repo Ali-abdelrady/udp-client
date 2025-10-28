@@ -198,6 +198,18 @@ func (c *Client) writeWorker(conn *net.UDPConn) {
 		if err != nil {
 			fmt.Println("failed to send packet")
 		}
+
+		// ✅ mark actual send time
+		if pkt.Trackable {
+			pp := &models.PendingPacket{
+				Packet:   pkt,
+				SendTime: time.Now(),
+				Retries:  0,
+				AckChan:  make(chan bool, 1),
+			}
+			c.pendingPackets.Store(pkt.ID, pp)
+		}
+
 	}
 }
 
@@ -265,22 +277,17 @@ func (c *Client) generatorWorker() {
 		finalPayload := c.buildPacketPayload(packet, packetID)
 		// fmt.Printf("Sended Packet ID : %v\n", packetID)
 
-		outgoingPacket := models.Packet{Payload: finalPayload, Addr: packet.Addr, ID: packetID, Done: packet.Done}
 		// fmt.Printf("Going PacketID = %v , Size = %v \n", outgoingPacket.ID, len(buf))
 
-		switch packet.OpCode {
-		case OpMessage, OpFileMeta, OpPing:
-			pp := &models.PendingPacket{
-				Packet:   outgoingPacket,
-				SendTime: time.Now(),
-				Retries:  0,
-				AckChan:  make(chan bool, 1),
-			}
-			c.pendingPackets.Store(outgoingPacket.ID, pp)
-			c.writeChan <- outgoingPacket
-		default:
-			c.writeChan <- outgoingPacket
+		outgoingPacket := models.Packet{
+			Payload:   finalPayload,
+			Addr:      packet.Addr,
+			ID:        packetID,
+			Done:      packet.Done,
+			Trackable: !isUnreliable,
 		}
+
+		c.writeChan <- outgoingPacket
 
 	}
 }
@@ -290,24 +297,23 @@ func (c *Client) ackListener() {
 	for {
 		ackPkt := <-c.ackChan
 
-		if value, ok := c.pendingPackets.Load(ackPkt.ID); ok {
+		if value, ok := c.pendingPackets.LoadAndDelete(ackPkt.ID); ok {
 
 			pp := value.(*models.PendingPacket)
-			rtt := time.Since(pp.SendTime)
 
-			c.updateRTT(rtt)
-			fmt.Printf(
-				"Packet %v | RTT: %v | Smoothed: %v | Var: %v | RTO: %v\n",
-				pp.Packet.ID, rtt, c.smoothedRTT, c.rttVar, c.rto,
-			)
+			fmt.Printf("Packet %v\n", pp.Packet.ID)
 			pp.AckChan <- true
-			c.pendingPackets.Delete(ackPkt.ID)
+			if pp.Packet.Done != nil {
+				pp.Packet.Done <- true
+			}
 		}
 	}
 }
 
 func (c *Client) retransmissionWorker() {
 	maxRetries := 3
+	timeout := time.Second
+
 	ticker := time.NewTicker(200 * time.Millisecond) // check more frequently
 
 	for range ticker.C {
@@ -316,26 +322,23 @@ func (c *Client) retransmissionWorker() {
 		c.pendingPackets.Range(func(key, value any) bool {
 			pp := value.(*models.PendingPacket)
 
-			// Get latest adaptive RTO
-			baseTimeout := c.rto
-			if baseTimeout == 0 {
-				baseTimeout = 500 * time.Millisecond // default before any RTT samples
-			}
-
-			nextRetryDelay := baseTimeout * time.Duration(1<<pp.Retries)
-
 			// Check if timeout expired
-			if now.Sub(pp.SendTime) > nextRetryDelay && pp.Retries < maxRetries {
+			if now.Sub(pp.SendTime) > timeout && pp.Retries < maxRetries {
 				fmt.Printf("⏱️ Retrying packet %d (attempt %d, timeout=%v)\n",
-					pp.Packet.ID, pp.Retries+1, baseTimeout)
+					pp.Packet.ID, pp.Retries+1, timeout)
 
 				// Retransmit
 				c.writeChan <- pp.Packet
 				pp.SendTime = now
 				pp.Retries++
+
 			} else if pp.Retries >= maxRetries {
 				fmt.Printf("❌ Packet %d failed after %d retries\n", pp.Packet.ID, pp.Retries)
 				c.pendingPackets.Delete(pp.Packet.ID)
+
+				if pp.Packet.Done != nil {
+					pp.Packet.Done <- false
+				}
 			}
 
 			return true

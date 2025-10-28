@@ -6,13 +6,14 @@ import (
 )
 
 type Packet struct {
-	Payload  []byte
-	Addr     *net.UDPAddr
-	ID       uint32
-	ClientID uint16
-	OpCode   byte
-	Done     chan bool
-	Length   uint16
+	Payload   []byte
+	Addr      *net.UDPAddr
+	ID        uint32
+	ClientID  uint16
+	OpCode    byte
+	Done      chan bool
+	Length    uint16
+	Trackable bool
 }
 
 type RawPacket struct {
