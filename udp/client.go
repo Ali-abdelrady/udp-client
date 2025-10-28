@@ -7,6 +7,7 @@ import (
 	"hole-punching-client/models"
 	"hole-punching-client/utils"
 	"io"
+	"log"
 	"net"
 	"os"
 	"os/signal"
@@ -50,29 +51,38 @@ type Client struct {
 	sendOutFiles   sync.Map // map[uint32]*models.SendSession
 	pendingPackets sync.Map
 
+	//? RTT & Retransmission time out
 	smoothedRTT time.Duration
 	rttVar      time.Duration
-	rto         time.Duration // Retransmission time out
+	rto         time.Duration
+
+	//? Congestion Control
+	congestionWindow    int // Congestion Window
+	slowStartThreshold  int // start slow threshold
+	maxCongestionWindow int
+	// bytesInFlight       float64
+	ackCount int
 
 	// fileManger *workers.FileManager
 	// ackManger *workers.AckManager
 }
 
 func (c *Client) ConnectToServer(addr string) {
+
 	udpAddr, err := net.ResolveUDPAddr("udp4", addr)
 	if err != nil {
-		fmt.Println("failed to resolve udp address, err:", err)
+		log.Println("failed to resolve udp address, err:", err)
 		return
 	}
 
 	// Establish the connection
 	connection, err := net.DialUDP("udp4", nil, udpAddr)
 	if err != nil {
-		fmt.Printf("client%d failed to connect to the server\n", c.ID)
+		log.Printf("client%d failed to connect to the server\n", c.ID)
 		return
 	}
 	defer connection.Close()
-	fmt.Println("✅ client connected to the server")
+	log.Println("✅ client connected to the server")
 
 	// Init variables and channels
 	c.writeChan = make(chan models.Packet, 50)
@@ -81,6 +91,10 @@ func (c *Client) ConnectToServer(addr string) {
 	c.ackChan = make(chan models.Packet, 200)
 	c.fileChunksChan = make(chan models.FileChunk, 100)
 	c.fileMetaChan = make(chan models.FileMeta, 50)
+
+	c.congestionWindow = 1
+	c.slowStartThreshold = 32
+	c.maxCongestionWindow = 100 // cap (optional)
 
 	// c.ackManger = workers.NewAckManager()
 
@@ -107,7 +121,7 @@ func (c *Client) ConnectToServer(addr string) {
 	for {
 		n, _, err := connection.ReadFromUDP(buffer)
 		if err != nil {
-			fmt.Println("failed to read server response, err:", err)
+			log.Println("failed to read server response, err:", err)
 			return
 		}
 		if n == 0 {
@@ -125,18 +139,18 @@ func (c *Client) ConnectToServer(addr string) {
 func (c *Client) startInteractiveCommandInput() {
 	scanner := bufio.NewScanner(os.Stdin)
 
-	fmt.Println("🟢 UDP Command Interface Started")
-	fmt.Println("Available commands:")
-	fmt.Println("  message <message>")
-	fmt.Println("  file <filepath>")
-	fmt.Println("  help")
-	fmt.Println("------------------------------")
+	log.Println("🟢 UDP Command Interface Started")
+	log.Println("Available commands:")
+	log.Println("  message <message>")
+	log.Println("  file <filepath>")
+	log.Println("  help")
+	log.Println("------------------------------")
 
 	for {
-		fmt.Print("> ")
+		log.Print("> ")
 
 		if !scanner.Scan() {
-			fmt.Println("\n❌ Input closed. Exiting interactive mode.")
+			log.Println("\n❌ Input closed. Exiting interactive mode.")
 			return
 		}
 
@@ -153,7 +167,7 @@ func (c *Client) startInteractiveCommandInput() {
 		// send message <message>
 		case "message":
 			if len(parts) < 2 {
-				fmt.Println("⚠ Usage: message <text>")
+				log.Println("⚠ Usage: message <text>")
 				continue
 			}
 
@@ -166,13 +180,13 @@ func (c *Client) startInteractiveCommandInput() {
 		// send file <clientId> <path>
 		case "file":
 			if len(parts) < 2 {
-				fmt.Println("⚠ Usage: file <filepath>")
+				log.Println("⚠ Usage: file <filepath>")
 				continue
 			}
 
 			filepath := parts[1]
 			if _, err := os.Stat(filepath); err != nil {
-				fmt.Println("❌ File not found:", filepath)
+				log.Println("❌ File not found:", filepath)
 				continue
 			}
 
@@ -180,24 +194,47 @@ func (c *Client) startInteractiveCommandInput() {
 
 		// show help
 		case "help":
-			fmt.Println("Available commands:")
-			fmt.Println("  message <message>   - send a message to client")
-			fmt.Println("  file <path>         - send a file to client")
-			fmt.Println("  help                - show this help message")
+			log.Println("Available commands:")
+			log.Println("  message <message>   - send a message to client")
+			log.Println("  file <path>         - send a file to client")
+			log.Println("  help                - show this help message")
 
 		default:
-			fmt.Printf("❌ Unknown command: '%s' (type 'help' for list)\n", command)
+			log.Printf("❌ Unknown command: '%s' (type 'help' for list)\n", command)
 		}
 	}
 }
 
 // ----- Workers ---------
 func (c *Client) writeWorker(conn *net.UDPConn) {
-	for pkt := range c.writeChan {
+	for {
+
+		pkt := <-c.writeChan
 		_, err := conn.Write(pkt.Payload)
 		if err != nil {
-			fmt.Println("failed to send packet")
+			log.Println("failed to send packet")
+			continue
 		}
+
+		// ✅ mark actual send time
+		if pkt.Trackable {
+			pp := &models.PendingPacket{
+				Packet:   pkt,
+				SendTime: time.Now(),
+				Retries:  0,
+				AckChan:  make(chan bool, 1),
+			}
+			c.pendingPackets.Store(pkt.ID, pp)
+		}
+
+		// pacing
+		interval := 10 * time.Millisecond
+		if c.smoothedRTT > 0 && c.congestionWindow > 0 {
+			pacingRate := float64(c.congestionWindow*CHUNKSIZE) / c.smoothedRTT.Seconds()
+			interval = time.Duration(float64(CHUNKSIZE) / pacingRate * float64(time.Second))
+		}
+
+		time.Sleep(interval)
 	}
 }
 
@@ -207,7 +244,7 @@ func (c *Client) parserWorker() {
 		raw := <-c.parserChan
 
 		if len(raw.Data) < 9 {
-			fmt.Println("Invalid packet format length")
+			log.Println("Invalid packet format length")
 			continue
 		}
 		// Packet [opcode 1] [packetId 4] [size 2] [clientId 2] [payload n]
@@ -221,14 +258,14 @@ func (c *Client) parserWorker() {
 		}
 		switch packet.OpCode {
 		case OpAck:
-			// fmt.Println("[Server] -> ", string(packet.Payload))
+			// log.Println("[Server] -> ", string(packet.Payload))
 			c.ackChan <- packet
 		case OpPong:
-			fmt.Printf("Client%d Ping Ack Recived \n", c.ID)
+			log.Printf("Client%d Ping Ack Recived \n", c.ID)
 			c.ackChan <- packet
 		case OpMessage:
-			fmt.Println("[Server] -> ", string(packet.Payload))
-			fmt.Printf("Recived Packet ID : %v\n", packet.ID)
+			log.Println("[Server] -> ", string(packet.Payload))
+			log.Printf("Recived Packet ID : %v\n", packet.ID)
 
 			outgoingPacket := packet
 			outgoingPacket.OpCode = OpAck
@@ -252,7 +289,7 @@ func (c *Client) generatorWorker() {
 		packet := <-c.generateChan
 
 		var packetID uint32
-		isUnreliable := packet.OpCode == OpAck || packet.OpCode == OpFileChunk || packet.OpCode == OpChunkStatusResponse
+		isUnreliable := packet.OpCode == OpAck || packet.OpCode == OpChunkStatusResponse
 
 		if isUnreliable {
 			// use server packetID
@@ -263,45 +300,68 @@ func (c *Client) generatorWorker() {
 		}
 
 		finalPayload := c.buildPacketPayload(packet, packetID)
-		// fmt.Printf("Sended Packet ID : %v\n", packetID)
+		// log.Printf("Sended Packet ID : %v\n", packetID)
 
-		outgoingPacket := models.Packet{Payload: finalPayload, Addr: packet.Addr, ID: packetID, Done: packet.Done}
-		// fmt.Printf("Going PacketID = %v , Size = %v \n", outgoingPacket.ID, len(buf))
+		outgoingPacket := models.Packet{Payload: finalPayload, Addr: packet.Addr, ID: packetID, Done: packet.Done, Trackable: !isUnreliable}
+		// log.Printf("Going PacketID = %v , Size = %v \n", outgoingPacket.ID, len(buf))
 
-		switch packet.OpCode {
-		case OpMessage, OpFileMeta, OpPing:
-			pp := &models.PendingPacket{
-				Packet:   outgoingPacket,
-				SendTime: time.Now(),
-				Retries:  0,
-				AckChan:  make(chan bool, 1),
-			}
-			c.pendingPackets.Store(outgoingPacket.ID, pp)
-			c.writeChan <- outgoingPacket
-		default:
-			c.writeChan <- outgoingPacket
-		}
-
+		c.writeChan <- outgoingPacket
 	}
 }
 
 func (c *Client) ackListener() {
-
 	for {
 		ackPkt := <-c.ackChan
 
-		if value, ok := c.pendingPackets.Load(ackPkt.ID); ok {
+		// Find pending packet
+		if value, ok := c.pendingPackets.LoadAndDelete(ackPkt.ID); ok {
 
 			pp := value.(*models.PendingPacket)
-			rtt := time.Since(pp.SendTime)
-
-			c.updateRTT(rtt)
-			fmt.Printf(
-				"Packet %v | RTT: %v | Smoothed: %v | Var: %v | RTO: %v\n",
-				pp.Packet.ID, rtt, c.smoothedRTT, c.rttVar, c.rto,
-			)
 			pp.AckChan <- true
-			c.pendingPackets.Delete(ackPkt.ID)
+			if pp.Packet.Done != nil {
+				pp.Packet.Done <- true
+			}
+
+			// --- RTT update that doesn't retransmitt ---
+			var rtt time.Duration
+			if pp.Retries == 0 {
+				rtt = time.Since(pp.SendTime)
+				c.updateRTT(rtt)
+			} else {
+				log.Printf("⚠ RTT sample ignored due to retransmission")
+			}
+
+			// --- Congestion Control ---
+			if c.congestionWindow < c.slowStartThreshold {
+				// Slow start: exponential growth
+				c.congestionWindow *= 2
+				log.Printf("🚀 Slow Start: cwnd doubled to %d\n", c.congestionWindow)
+			} else {
+				// Congestion avoidance: linear growth (1 packet per RTT)
+				c.ackCount++
+				if c.ackCount >= c.congestionWindow {
+					c.congestionWindow++
+					c.ackCount = 0
+					log.Printf("📈 Linear Growth: cwnd increased to %d\n", c.congestionWindow)
+				}
+			}
+
+			// Clamp cwnd to prevent runaway growth
+			if c.congestionWindow > c.maxCongestionWindow {
+				c.congestionWindow = c.maxCongestionWindow
+			}
+
+			// --- Logging ---
+			log.Printf(
+				"✅ ACK %v | RTT: %v | Smoothed: %v | Var: %v | RTO: %v | cwnd: %d | ssthresh: %d\n",
+				pp.Packet.ID,
+				rtt,
+				c.smoothedRTT,
+				c.rttVar,
+				c.rto,
+				c.congestionWindow,
+				c.slowStartThreshold,
+			)
 		}
 	}
 }
@@ -326,16 +386,25 @@ func (c *Client) retransmissionWorker() {
 
 			// Check if timeout expired
 			if now.Sub(pp.SendTime) > nextRetryDelay && pp.Retries < maxRetries {
-				fmt.Printf("⏱️ Retrying packet %d (attempt %d, timeout=%v)\n",
+				log.Printf("⏱️ Retrying packet %d (attempt %d, timeout=%v)\n",
 					pp.Packet.ID, pp.Retries+1, baseTimeout)
 
 				// Retransmit
 				c.writeChan <- pp.Packet
 				pp.SendTime = now
 				pp.Retries++
+
 			} else if pp.Retries >= maxRetries {
-				fmt.Printf("❌ Packet %d failed after %d retries\n", pp.Packet.ID, pp.Retries)
+				log.Printf("❌ Packet %d failed after %d retries\n", pp.Packet.ID, pp.Retries)
 				c.pendingPackets.Delete(pp.Packet.ID)
+
+				// Congestion reaction
+				c.slowStartThreshold = max(2, c.congestionWindow/2)
+				c.congestionWindow = 1
+
+				if pp.Packet.Done != nil {
+					pp.Packet.Done <- false
+				}
 			}
 
 			return true
@@ -375,7 +444,7 @@ func (c *Client) RequestFileChunks(session *models.ReceiveSession) {
 
 		fileID := session.FileID
 
-		fmt.Printf("Requesting chunk %d...\n", seq)
+		log.Printf("Requesting chunk %d...\n", seq)
 
 		req := make([]byte, 6)
 		binary.BigEndian.PutUint32(req[0:4], fileID)
@@ -393,15 +462,15 @@ func (c *Client) RequestFileChunks(session *models.ReceiveSession) {
 		select {
 		case resp = <-session.AckChan:
 			// response received
-			fmt.Println("I Recieved the ack of seq")
+			log.Println("I Recieved the ack of seq")
 		case <-timeout.C:
-			fmt.Printf("⏱ Timeout waiting for chunk %d, sending status query...\n", seq)
+			log.Printf("⏱ Timeout waiting for chunk %d, sending status query...\n", seq)
 			c.sendChunkStatusRequest(packet)
 			// Wait again for the status response
 			select {
 			case resp = <-session.AckChan:
 			case <-time.After(3 * time.Second):
-				fmt.Printf("⚠️ No status response for chunk %d, aborting.\n", seq)
+				log.Printf("⚠️ No status response for chunk %d, aborting.\n", seq)
 				return
 			}
 		}
@@ -410,26 +479,26 @@ func (c *Client) RequestFileChunks(session *models.ReceiveSession) {
 
 		switch resp.Status {
 		case 200:
-			fmt.Printf("Chunk %d received OK\n", seq)
+			log.Printf("Chunk %d received OK\n", seq)
 			continue
 		case 0: // NotSent
-			fmt.Printf("Chunk %d not sent yet, retrying...\n", seq)
+			log.Printf("Chunk %d not sent yet, retrying...\n", seq)
 			seq-- // retry
 			continue
 		case 1: // InProgress
-			fmt.Printf("Chunk %d still being processed, waiting...\n", seq)
+			log.Printf("Chunk %d still being processed, waiting...\n", seq)
 			time.Sleep(2 * time.Second)
 			seq--
 			continue
 		case 2: // AlreadySent
-			fmt.Printf("Chunk %d already sent, retrying...\n", seq)
+			log.Printf("Chunk %d already sent, retrying...\n", seq)
 			seq--
 			continue
 		case 3: // NotFound
-			fmt.Printf("Chunk %d not found, aborting.\n", seq)
+			log.Printf("Chunk %d not found, aborting.\n", seq)
 			return
 		default:
-			fmt.Printf("Unknown status %d for chunk %d\n", resp.Status, seq)
+			log.Printf("Unknown status %d for chunk %d\n", resp.Status, seq)
 			return
 		}
 	}
@@ -442,7 +511,7 @@ func (c *Client) sendChunkStatusRequest(reqPacket models.Packet) {
 	clientID := reqPacket.ClientID
 	addr := reqPacket.Addr
 
-	fmt.Printf("📡 Sending status request for FileID=%d, Seq=%d\n", fileID, seq)
+	log.Printf("📡 Sending status request for FileID=%d, Seq=%d\n", fileID, seq)
 
 	// Build payload: [fileID 4][seq 2]
 	buf := make([]byte, 6)
@@ -462,10 +531,9 @@ func (c *Client) sendChunkStatusRequest(reqPacket models.Packet) {
 func (c *Client) sendFileMeta(path string) {
 	file, err := os.Open(path)
 	if err != nil {
-		fmt.Println("falied to open file with path: ", "./message", err)
+		log.Println("falied to open file with path: ", "./message", err)
 		return
 	}
-
 	// file Meta
 	stat, _ := file.Stat()
 	fileId := utils.GenerateTimestampID()
@@ -474,7 +542,7 @@ func (c *Client) sendFileMeta(path string) {
 	doneChan := make(chan bool, 1)
 	// totalChunks := uint32((fileSize + CHUNKSIZE - 1) / CHUNKSIZE)
 
-	c.sendOutFiles.Store(fileId, &models.SendSession{File: file, FileID: fileId, FileSize: uint32(fileSize), FileName: fileName, CreatedAt: time.Now()})
+	// c.sendOutFiles.Store(fileId, &models.SendSession{File: file, FileID: fileId, FileSize: uint32(fileSize), FileName: fileName, CreatedAt: time.Now()})
 
 	// Build Buffer [fileId 4] [fileSize 4] [ChunkSize 2] [filename n]
 	nameBytes := []byte(fileName)
@@ -492,14 +560,51 @@ func (c *Client) sendFileMeta(path string) {
 
 	c.generateChan <- pkt
 
+	if !<-doneChan {
+		log.Println("❌ Didn't get the meta ack")
+		return
+	}
+
+	// Start Sending file chunks
+	time.Sleep(1 * time.Microsecond)
+
+	seq := uint16(0)
+	chunk := make([]byte, CHUNKSIZE)
+
+	for {
+		n, err := file.Read(chunk)
+
+		if n > 0 {
+
+			//  [fileId 4] [seq 2]
+			payload := make([]byte, 6+n)
+			binary.BigEndian.PutUint32(payload[:4], fileId)
+			binary.BigEndian.PutUint16(payload[4:6], seq)
+			copy(payload[6:], chunk[:n])
+
+			c.generateChan <- models.Packet{OpCode: OpFileChunk, Payload: payload}
+
+			seq++
+		}
+
+		if err == io.EOF {
+			break
+		}
+
+		if err != nil {
+			log.Println("failed to read files")
+			return
+		}
+	}
 }
 
+// f
 // Reciever
 
 func (c *Client) pingServer() {
 	for {
 		c.generateChan <- models.Packet{OpCode: OpPing}
-		fmt.Printf("client%d sent ping\n", c.ID)
+		log.Printf("client%d sent ping\n", c.ID)
 		time.Sleep(28 * time.Second) // wait before next
 	}
 }
@@ -507,7 +612,7 @@ func (c *Client) pingServer() {
 func (c *Client) RegisterClient() {
 
 	c.generateChan <- models.Packet{OpCode: OpRegister}
-	fmt.Printf("client%d sent: reqeust for reigstration\n", c.ID)
+	log.Printf("client%d sent: reqeust for reigstration\n", c.ID)
 }
 
 func (c *Client) onChunkRequestReceived(packet models.Packet) {
@@ -515,11 +620,11 @@ func (c *Client) onChunkRequestReceived(packet models.Packet) {
 	fileID := binary.BigEndian.Uint32(packet.Payload[:4])
 	seq := binary.BigEndian.Uint16(packet.Payload[4:])
 
-	fmt.Printf("CHUNK REQ of fileID:%v , seq:%v \n", fileID, seq)
+	log.Printf("CHUNK REQ of fileID:%v , seq:%v \n", fileID, seq)
 
 	val, exist := c.sendOutFiles.Load(fileID)
 	if !exist {
-		fmt.Printf("fileID %d not registered for sending", fileID)
+		log.Printf("fileID %d not registered for sending", fileID)
 		return
 	}
 	session := val.(*models.SendSession)
@@ -529,7 +634,7 @@ func (c *Client) onChunkRequestReceived(packet models.Packet) {
 	chunk := make([]byte, CHUNKSIZE)
 	n, err := session.File.ReadAt(chunk, offset)
 	if err != nil && err != io.EOF {
-		fmt.Println(err)
+		log.Println(err)
 		return
 	}
 
@@ -555,7 +660,7 @@ func (c *Client) onFileMetaReceived(packet models.Packet) {
 	fileName := string(packet.Payload[10:])
 	clientID := packet.ClientID
 
-	fmt.Printf("📦 Meta from Client%d | FileID=%d | Size=%d bytes | Name=%s | ChunkSize=%d \n",
+	log.Printf("📦 Meta from Client%d | FileID=%d | Size=%d bytes | Name=%s | ChunkSize=%d \n",
 		clientID, fileId, fileSize, fileName, chunkSize)
 
 	meta := models.FileMeta{
@@ -580,7 +685,7 @@ func (c *Client) onFileChunkReceived(packet models.Packet) {
 	seq := binary.BigEndian.Uint16(packet.Payload[4:6])
 	fileData := append([]byte{}, packet.Payload[6:]...)
 
-	fmt.Println("I recieved Chunk of Seq =", seq)
+	log.Println("I recieved Chunk of Seq =", seq)
 	chunk := models.FileChunk{
 		FileID:   fileId,
 		Seq:      seq,
@@ -590,12 +695,10 @@ func (c *Client) onFileChunkReceived(packet models.Packet) {
 
 	c.fileChunksChan <- chunk
 
-	c.ackChan <- packet
-	// Mark as chunk recieved
-	// ch := c.ackManger.GetAck(packet.ID)
-	// if ch != nil {
-	// 	ch <- true
-	// }
+	newPacket := packet
+	newPacket.OpCode = OpAck
+	newPacket.Payload = []byte{}
+	c.generateChan <- newPacket
 
 }
 
@@ -613,7 +716,7 @@ func (c *Client) onChunkStatusResponseReceived(packet models.Packet) {
 
 	val, ok := c.receivedFiles.Load(fileID)
 	if !ok {
-		fmt.Printf("⚠️ No active session found for FileID=%d\n", fileID)
+		log.Printf("⚠️ No active session found for FileID=%d\n", fileID)
 		return
 	}
 
@@ -624,7 +727,7 @@ func (c *Client) onChunkStatusResponseReceived(packet models.Packet) {
 	case session.AckChan <- models.AckResponse{Seq: seq, Status: status}:
 		// sent successfully to listener
 	default:
-		fmt.Printf("⚠️ AckChan full, dropping status response for FileID=%d Seq=%d\n", fileID, seq)
+		log.Printf("⚠️ AckChan full, dropping status response for FileID=%d Seq=%d\n", fileID, seq)
 	}
 }
 
@@ -632,7 +735,7 @@ func (c *Client) onChunkStatusRequestReceived(packet models.Packet) {
 	fileID := binary.BigEndian.Uint32(packet.Payload[:4])
 	seq := binary.BigEndian.Uint16(packet.Payload[4:6])
 
-	fmt.Printf("Recieved Chunk Ack Request of Seq = %v \n", seq)
+	log.Printf("Recieved Chunk Ack Request of Seq = %v \n", seq)
 	status := byte(3) // Default: Not Found
 
 	if val, ok := c.sendOutFiles.Load(fileID); ok {
@@ -668,21 +771,21 @@ func (c *Client) createSessionFromMeta(meta models.FileMeta) {
 	// Check if file already exists
 	_, exists := c.receivedFiles.Load(meta.FileID)
 	if exists {
-		fmt.Println("Meta already exists for file:", meta.FileName)
+		log.Println("Meta already exists for file:", meta.FileName)
 		return
 	}
 
 	// Start Creating New File
 	wd, err := os.Getwd()
 	if err != nil {
-		fmt.Println("Error getting working directory:", err)
+		log.Println("Error getting working directory:", err)
 		return
 	}
 
 	filePath := filepath.Join(wd, fmt.Sprintf("client%d_%s", meta.ClientID, meta.FileName))
 	file, err := os.Create(filePath)
 	if err != nil {
-		fmt.Println("Error creating file:", err)
+		log.Println("Error creating file:", err)
 		return
 	}
 
@@ -701,37 +804,37 @@ func (c *Client) createSessionFromMeta(meta models.FileMeta) {
 	c.receivedFiles.Store(meta.FileID, session)
 
 	// Start Req for file chunks
-	c.RequestFileChunks(session)
+	// c.RequestFileChunks(session)
 }
 
 func (c *Client) appendFileChunk(chunk models.FileChunk) {
 	val, exists := c.receivedFiles.Load(chunk.FileID)
 	if !exists {
-		fmt.Printf("Received chunk for unknown file %d (waiting for meta)\n", chunk.FileID)
+		log.Printf("Received chunk for unknown file %d (waiting for meta)\n", chunk.FileID)
 		return
 	}
 
 	session := val.(*models.ReceiveSession)
 
 	if session.Chunks[chunk.Seq] {
-		fmt.Printf("⚠ Duplicate Seq = %d ignored \n", chunk.Seq)
+		log.Printf("⚠ Duplicate Seq = %d ignored \n", chunk.Seq)
 		return
 	}
 
-	session.AckChan <- models.AckResponse{
-		Seq:    chunk.Seq,
-		Status: 200, // ReceivedOK
-	}
+	// session.AckChan <- models.AckResponse{
+	// 	Seq:    chunk.Seq,
+	// 	Status: 200, // ReceivedOK
+	// }
 
 	session.Chunks[chunk.Seq] = true
 
 	offset := int64(chunk.Seq) * int64(session.ChunkSize)
 	session.File.WriteAt(chunk.Data, offset)
 	session.Received++
-	fmt.Printf("Recieved From Client%d (%d/%d) seq = %d \n", chunk.ClientID, session.Received, session.TotalChunk, chunk.Seq)
+	log.Printf("Recieved From Client%d (%d/%d) seq = %d \n", chunk.ClientID, session.Received, session.TotalChunk, chunk.Seq)
 
 	if session.Received > session.TotalChunk {
-		fmt.Printf("✅ Client%d File %d done (%.2f KB)\n", chunk.ClientID, chunk.FileID, float64(session.TotalChunk))
+		log.Printf("✅ Client%d File %d done (%.2f KB)\n", chunk.ClientID, chunk.FileID, float64(session.TotalChunk))
 		session.File.Close()
 		// close(session.ChunkChan)
 		c.receivedFiles.Delete(chunk.FileID)
@@ -751,7 +854,7 @@ func (c *Client) cleanupSendOutFiles(ttl time.Duration) {
 		c.sendOutFiles.Range(func(key, value any) bool {
 			session := value.(*models.SendSession)
 			if now.Sub(session.CreatedAt) > ttl {
-				fmt.Printf("🧹 Cleaning up expired send session (fileID=%d, name=%s)\n", session.FileID, session.FileName)
+				log.Printf("🧹 Cleaning up expired send session (fileID=%d, name=%s)\n", session.FileID, session.FileName)
 				session.File.Close()
 				c.sendOutFiles.Delete(key)
 			}
@@ -766,8 +869,8 @@ func (clientID *Client) setupGracfulShutdown() {
 
 	go func() {
 		<-sigChan
-		fmt.Println("\n🛑 Shutting down server gracefully...")
-		// fmt.Println("AllocationCnt: ", c.allocationCnt)
+		log.Println("\n🛑 Shutting down server gracefully...")
+		// log.Println("AllocationCnt: ", c.allocationCnt)
 		utils.PrintApiLog("Server Exit")
 		os.Exit(0)
 	}()
